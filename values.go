@@ -17,6 +17,7 @@ type Value interface {
 	Size() int
 	Dtype() Dtype
 	Eq(other Value) bool
+	Data() interface{}
 
 	clone() (Value, error)
 	zero() Value
@@ -26,6 +27,15 @@ type Value interface {
 
 type Valuer interface {
 	Value() Value
+}
+
+type Zeroer interface {
+	Value
+	Zero()
+}
+
+type Setter interface {
+	SetAll(interface{}) error
 }
 
 // Tensor is a Value. It wraps over types.Tensor
@@ -122,7 +132,7 @@ func (s Scalar) Type() Type         { return s.t }
 func (s Scalar) Dtype() Dtype       { return s.t }
 func (s Scalar) Shape() types.Shape { return types.ScalarShape() }
 func (s Scalar) Size() int          { return 1 }
-func (s Scalar) V() interface{}     { return s.v }
+func (s Scalar) Data() interface{}  { return s.v }
 
 func (s Scalar) Eq(other Value) bool {
 	os, ok := other.(Scalar)

@@ -483,7 +483,13 @@ func (op sliceOp) Type() Type {
 	a := newTypeVariable("a", withTVConstraints(floats))
 	tt := newTensorType(op.d, a)
 
-	selection := op.End() - op.Start()
+	var selection int
+
+	if op.Slice == nil {
+		selection = -1
+	} else {
+		selection = op.End() - op.Start()
+	}
 
 	if selection == 1 {
 		if op.d == 1 {
@@ -505,29 +511,7 @@ func (op sliceOp) inferShape(typ Type, inputs ...*Node) (s types.Shape, err erro
 	}
 
 	t := inputs[0]
-
-	s = make(types.Shape, len(t.shape))
-	for i, v := range t.shape {
-		s[i] = v
-	}
-	if op.all() {
-		return
-	}
-
-	s[op.along] = op.End() - op.Start()
-
-	if s.Eq(types.Shape{1, 1}) || s.IsScalar() {
-		s = scalarShape
-	}
-
-	switch {
-	case s.IsRowVec():
-		s = s[1:]
-	case s.IsColVec():
-		s = s[:1]
-	}
-
-	return
+	return t.shape.S(op.Slice)
 }
 
 func (op sliceOp) DiffWRT(i int) []bool {
@@ -662,6 +646,11 @@ func (op sliceOp) WriteHash(h hash.Hash) {
 		panic(err)
 	}
 	fmt.Fprintf(h, "%v", op.along)
+	if op.Slice == nil {
+		fmt.Fprintf(h, ":")
+		return
+	}
+
 	if err := binary.Write(h, binary.LittleEndian, byte(op.Start())); err != nil {
 		panic(err)
 	}
@@ -671,6 +660,7 @@ func (op sliceOp) WriteHash(h hash.Hash) {
 	if err := binary.Write(h, binary.LittleEndian, byte(op.Step())); err != nil {
 		panic(err)
 	}
+
 }
 func (op sliceOp) Hashcode() uint32 {
 	h := fnv.New32a()
@@ -695,7 +685,7 @@ func (op sliceOp) String() string {
 	return buf.String()
 }
 
-func (op sliceOp) all() bool { return op.End() <= op.Start() }
+func (op sliceOp) all() bool { return op.Slice == nil || op.End() <= op.Start() }
 
 // T[:] +=incr
 // THIS IS AN UNSAFE OPERATION
@@ -880,6 +870,12 @@ func (op sliceIncrOp) WriteHash(h hash.Hash) {
 	if err := binary.Write(h, binary.LittleEndian, byte(op.along)); err != nil {
 		panic(err)
 	}
+
+	if op.Slice == nil {
+		fmt.Fprintf(h, ":")
+		return
+	}
+
 	if err := binary.Write(h, binary.LittleEndian, byte(op.Start())); err != nil {
 		panic(err)
 	}
@@ -1010,15 +1006,22 @@ func (op transposeOp) Do(inputs ...Value) (retVal Value, err error) {
 
 	t := inputs[0].(Tensor).Tensor
 
+	throwaway := types.BorrowInts(len(op.pattern))
+	copy(throwaway, op.pattern)
+	var ret types.Tensor
+	if ret, err = tensor.T(t, throwaway...); err != nil {
+		return
+	}
+
 	// the reason for this is because the .T() method of a Tensor
 	// will use the axes in the .transposedWith field
 	// Later when .UT() is called, the .transposedWith field is recycled into the pool
-	throwaway := types.BorrowInts(len(op.pattern))
-	copy(throwaway, op.pattern)
+	// throwaway := types.BorrowInts(len(op.pattern))
+	// copy(throwaway, op.pattern)
 
-	t.T(throwaway...)
-	ret := t.Materialize()
-	t.UT()
+	// t.T(throwaway...)
+	// ret := t.Materialize()
+	// t.UT()
 	return anyToValue(ret)
 }
 

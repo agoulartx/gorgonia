@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
+	"encoding/gob"
 	"fmt"
-	"log"
+	"io"
 	"os"
 
 	. "github.com/chewxy/gorgonia"
@@ -59,7 +61,7 @@ func NewStackedDA(g *ExprGraph, batchSize, size, inputs, outputs, layers int, hi
 	}
 
 	final := NewSoftmaxLayer(WithGraph(g), WithConf(hiddenSizes[len(hiddenSizes)-1], outputs, batchSize))
-	final.input = input
+	final.input = hiddenLayers[len(hiddenLayers)-1].output
 	WithName("Softmax_w")(final.w)
 	WithName("Softmax_b")(final.b)
 
@@ -85,12 +87,9 @@ func (sda *StackedDA) Pretrain(x types.Tensor, epoch int) (err error) {
 	var inputs, model Nodes
 	var machines []VM
 
-	logfile, err := os.OpenFile("exec.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-	logger := log.New(logfile, "", 0)
-
 	inputs = Nodes{sda.input}
 	var costValue Value
-	for i, da := range sda.autoencoders {
+	for _, da := range sda.autoencoders {
 		var cost *Node
 		var grads Nodes
 		cost, err = da.Cost(sda.input)
@@ -100,32 +99,24 @@ func (sda *StackedDA) Pretrain(x types.Tensor, epoch int) (err error) {
 			return
 		}
 
-		prog, locMap, err := CompileFunctionNEW(sda.g, inputs, grads)
+		prog, locMap, err := CompileFunction(sda.g, inputs, grads)
 		if err != nil {
 			return err
 		}
-		if epoch == 0 {
-			log.Printf("Layer: %d \n%v, %d", i, prog, FmtNodeMap(locMap))
-		}
-		// logger.SetPrefix(fmt.Sprintf("Train Layer %d:\t", i))
+
 		var m VM
-		if epoch == 0 {
-			// m = NewTapeMachine(prog, locMap, WithLogger(logger), WithWatchlist(), WithValueFmt("%+1.1s"), WithInfWatch())
-			m = NewTapeMachine(prog, locMap, WithLogger(logger), WithValueFmt("%+1.1s"), WithWatchlist(), TraceExec())
-			// m = NewTapeMachine(prog, locMap, WithNaNWatch(), WithInfWatch())
-		} else {
-			m = NewTapeMachine(prog, locMap, WithNaNWatch(), WithInfWatch())
-		}
 		m = NewTapeMachine(prog, locMap)
 		machines = append(machines, m)
 	}
 
-	solver := NewVanillaSolver(WithBatchSize(float64(sda.BatchSize)))
+	// solver := NewVanillaSolver(WithBatchSize(float64(sda.BatchSize)))
+	solver := NewVanillaSolver()
 	model = make(Nodes, 3)
 
 	batches := x.Shape()[0] / sda.BatchSize
-	var start int
+	avgCosts := make([]float64, len(sda.autoencoders))
 
+	var start int
 	for i, da := range sda.autoencoders {
 		var layerCosts []float64
 		for batch := 0; batch < batches; batch++ {
@@ -134,29 +125,39 @@ func (sda *StackedDA) Pretrain(x types.Tensor, epoch int) (err error) {
 				return
 			}
 
-			// logfile.Truncate(0)
-			// logfile.Seek(0, 0)
-			// log.Printf("Layer %d", i)
 			model = model[:0]
 			Let(sda.input, input)
 			if err = machines[i].RunAll(); err != nil {
 				return
 			}
-			c := costValue.(Scalar).V().(float64)
+			c := costValue.Data().(float64)
 			layerCosts = append(layerCosts, c)
 			model = append(model, da.w, da.b, da.h.b)
 
 			solver.Step(model)
 			machines[i].Reset()
 		}
-		log.Printf("Avg Cost: %v", avgF64s(layerCosts))
+		avgC := avgF64s(layerCosts)
+		avgCosts[i] = avgC
 	}
+
+	// nicely format our costs
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, "%d\t", epoch)
+	for i, ac := range avgCosts {
+		if i < len(avgCosts)-1 {
+			fmt.Fprintf(&buf, "%v\t", ac)
+		} else {
+			fmt.Fprintf(&buf, "%v", ac)
+		}
+	}
+	trainingLog.Println(buf.String())
 
 	return nil
 }
 
-func (sda *StackedDA) Finetune(x types.Tensor, y []int) (err error) {
-	var costs, model Nodes
+func (sda *StackedDA) Finetune(x types.Tensor, y []int, epoch int) (err error) {
+	var model Nodes
 	for i, da := range sda.autoencoders {
 		if i > 0 {
 			hidden := sda.hiddenLayers[i-1]
@@ -173,18 +174,146 @@ func (sda *StackedDA) Finetune(x types.Tensor, y []int) (err error) {
 	}
 
 	logprobs := Must(Neg(Must(Log(probs))))
-	for _, correct := range y {
-		cost := Must(Slice(logprobs, S(correct)))
-		costs = append(costs, cost)
+
+	// solver := NewVanillaSolver(WithBatchSize(float64(sda.BatchSize)))
+	solver := NewVanillaSolver()
+
+	batches := x.Shape()[0] / sda.BatchSize
+
+	var cost *Node
+	bs := NewConstant(float64(sda.BatchSize))
+	losses := make(Nodes, sda.BatchSize)
+	losses = losses[:0]
+	cvs := make([]float64, batches)
+	cvs = cvs[:0]
+	for batch := 0; batch < batches; batch++ {
+		losses = losses[:0]
+		start := batch * sda.BatchSize
+		end := start + sda.BatchSize
+
+		if start >= len(y) {
+			break
+		}
+
+		// logfile, _ := os.OpenFile(fmt.Sprintf("execlog/exec_%v_%v.log", epoch, batch), os.O_TRUNC|os.O_WRONLY|os.O_CREATE, 0644)
+		// logger := log.New(logfile, "", 0)
+
+		for i, correct := range y[start:end] {
+			var loss *Node
+
+			if sda.BatchSize == 1 {
+				if loss, err = Slice(logprobs, S(correct)); err != nil {
+					return
+				}
+			} else {
+				if loss, err = Slice(logprobs, S(i), S(correct)); err != nil {
+					return
+				}
+			}
+
+			losses = append(losses, loss)
+		}
+		// Manual way of meaning the costs: we first sum them up, then div by the batch size
+		if cost, err = ReduceAdd(losses); err != nil {
+			return
+		}
+
+		if cost, err = Div(cost, bs); err != nil {
+			return
+		}
+
+		g := sda.g.SubgraphRoots(cost)
+
+		var input types.Tensor
+		if input, err = tensor.Slice(x, S(start, end)); err != nil {
+			return
+		}
+
+		// machine := NewLispMachine(g, WithLogger(logger), LogBothDir(), WithWatchlist(), WithValueFmt("%+1.1s"))
+		machine := NewLispMachine(g)
+		Let(sda.input, input)
+		if err = machine.RunAll(); err != nil {
+			return
+		}
+
+		solver.Step(model)
+		cvs = append(cvs, cost.Value().(Scalar).Data().(float64))
 	}
 
-	g := sda.g.SubgraphRoots(costs...)
-	machine := NewLispMachine(g)
+	trainingLog.Printf("%d\t%v", epoch, avgF64s(cvs))
+	return nil
+}
+
+func (sda *StackedDA) Forwards(x types.Tensor) (res types.Tensor, err error) {
+	// logfile, _ := os.OpenFile("exec.log", os.O_TRUNC|os.O_WRONLY|os.O_CREATE, 0644)
+	// logger := log.New(logfile, "", 0)
+
+	if sda.final.output == nil {
+		panic("sda.final not set!")
+	}
+
+	probs := sda.final.output
+	logprobs := Must(Neg(Must(Log(probs))))
+
+	// subgraph, and create a machine
+	g := sda.g.SubgraphRoots(logprobs)
+	// machine := NewLispMachine(g, WithLogger(logger), LogBothDir(), WithWatchlist(), ExecuteFwdOnly(), WithValueFmt("%+s"))
+	machine := NewLispMachine(g, ExecuteFwdOnly())
+
+	Let(sda.input, x)
 	if err = machine.RunAll(); err != nil {
 		return
 	}
 
-	solver := NewVanillaSolver()
-	solver.Step(model)
-	return nil
+	res = logprobs.Value().(Tensor).Tensor
+	return
+}
+
+// Save saves the model
+func (sda *StackedDA) Save(filename string) (err error) {
+	var f io.WriteCloser
+	if f, err = os.OpenFile(filename, os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644); err != nil {
+		return
+	}
+
+	encoder := gob.NewEncoder(f)
+	for _, da := range sda.autoencoders {
+		if err = encoder.Encode(da.Neuron); err != nil {
+			return
+		}
+
+		if err = encoder.Encode(da.h); err != nil {
+			return
+		}
+	}
+
+	if err = encoder.Encode(sda.final.Neuron); err != nil {
+		return
+	}
+	f.Close()
+	return
+}
+
+func (sda *StackedDA) Load(filename string) (err error) {
+	var f io.ReadCloser
+	if f, err = os.Open(filename); err != nil {
+		return
+	}
+
+	decoder := gob.NewDecoder(f)
+	for _, da := range sda.autoencoders {
+		if err = decoder.Decode(&da.Neuron); err != nil {
+			return
+		}
+
+		if err = decoder.Decode(&da.h); err != nil {
+			return
+		}
+	}
+
+	if err = decoder.Decode(&sda.final.Neuron); err != nil {
+		return
+	}
+	f.Close()
+	return
 }

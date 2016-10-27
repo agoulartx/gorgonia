@@ -1,6 +1,8 @@
 package gorgonia
 
 import (
+	"fmt"
+
 	"github.com/chewxy/gorgonia/tensor/types"
 	"github.com/pkg/errors"
 )
@@ -127,27 +129,22 @@ func Mul(a, b *Node) (retVal *Node, err error) {
 	switch {
 	case a.IsVector() && b.IsVector():
 		op = linAlgBinOp{āBinaryOperator: vecDotOperator}
-	case a.IsVector() || b.IsVector():
-		if a.IsVector() {
-			// b is matrix
-			op = linAlgBinOp{
-				āBinaryOperator: matVecMulOperator,
-				transA:          true,
-			}
-
-			// we return early because b is a matrix
-			// the inputs are swapped
-			return binOpNode(op, b, a)
-		} else {
-			// a is matrix
-			op = linAlgBinOp{āBinaryOperator: matVecMulOperator}
-		}
-	default:
-		// TODO: maybe align shapes?
+		return binOpNode(op, a, b)
+	case a.IsVector() && b.IsMatrix():
+		op = linAlgBinOp{āBinaryOperator: matVecMulOperator, transA: true}
+		return binOpNode(op, b, a)
+	case a.IsMatrix() && b.IsVector():
+		op = linAlgBinOp{āBinaryOperator: matVecMulOperator}
+		return binOpNode(op, a, b)
+	case a.IsMatrix() && b.IsMatrix():
 		op = linAlgBinOp{āBinaryOperator: matMulOperator}
+		return binOpNode(op, a, b)
+	default:
+		err = nyi("Mul", fmt.Sprintf("a %v b %v", a.shape, b.shape))
+		return
 	}
+	panic("unreachable")
 
-	return binOpNode(op, a, b)
 }
 
 func OuterProd(a, b *Node) (retVal *Node, err error) {
@@ -544,14 +541,18 @@ func Slice(n *Node, slices ...types.Slice) (retVal *Node, err error) {
 
 	retVal = n
 	for i, slice := range slices {
-		var op sliceOp
+		if retVal.IsScalar() {
+			err = NewError(ShapeError, "cannot slice a scalar value (%v). Slice %d (%v)", retVal, i, slice)
+			return
+		}
 
-		// a nil slice represents ":"
-		if slice == nil {
-			// op = newSliceOp(0, -1, i, retVal.Dims())
-			continue
-		} else {
+		var op sliceOp
+		switch {
+		case retVal.shape.IsVector():
+			op = newSliceOp(slice, 0, retVal.Dims())
+		default:
 			op = newSliceOp(slice, i, retVal.Dims())
+
 		}
 
 		if retVal, err = applyOp(op, retVal); err != nil {
